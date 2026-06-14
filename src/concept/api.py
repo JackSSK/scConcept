@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from huggingface_hub import HfApi, hf_hub_download
+from lightning.pytorch.loggers import CSVLogger
 from lamin_dataloader import BaseCollate, InMemoryCollection
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -54,6 +55,9 @@ class scConcept:
         self.tokenizer = None
         self.device = None
         self.gene_mappings_path = None
+        self.panels_dir = None
+        self.training_log_dir = None
+        self.training_metrics_path = None
 
     def _download_files_if_needed(self, model_name: str, model_dir: Path, decoder_model_name: str = "mlp-nb.ckpt"):
         """
@@ -676,7 +680,16 @@ class scConcept:
 
         return float(np.log(n_cells) - loss.cpu().item())
 
-    def train(self, adata_list, species=None, max_steps=None, batch_size=None, num_workers: int = 8):
+    def train(
+        self,
+        adata_list,
+        species=None,
+        max_steps=None,
+        batch_size=None,
+        num_workers: int = 8,
+        save_dir: str | Path = "./training_logs/",
+        panels_dir: str | Path = None,
+    ):
         """Train a new model using the configuration in self.cfg.
 
         Uses self.model if it exists, otherwise initializes a new model.
@@ -693,6 +706,9 @@ class scConcept:
             batch_size: Optional batch size for training. If provided, overrides config value.
             num_workers: Number of data loading workers for training. Clamped to available SLURM CPUs
                 by the datamodule, matching ``extract_embeddings`` behavior. Defaults to 8.
+            save_dir: Directory where CSVLogger writes training logs. Defaults to ``./training_logs/``.
+            panels_dir: Optional panels directory to use for this training run. If provided, overrides
+                the loaded model panels directory and ``cfg.PATH.PANELS_PATH``.
 
         Examples::
 
@@ -723,7 +739,8 @@ class scConcept:
 
         adaptaion = self.model is not None
 
-        panels_dir = self.panels_dir if adaptaion else self.cfg.PATH.PANELS_PATH
+        if panels_dir is None:
+            panels_dir = self.panels_dir if adaptaion else self.cfg.PATH.PANELS_PATH
 
         # Override config values if provided
         if max_steps is not None:
@@ -808,16 +825,21 @@ class scConcept:
             "val_loader_names": [],
         }
         datamodule = AnnDataModule(**datamodule_args)
+        csv_logger = CSVLogger(save_dir=save_dir)
+        self.training_log_dir = Path(csv_logger.log_dir)
+        self.training_metrics_path = self.training_log_dir / "metrics.csv"
+        logger.info("Training metrics will be logged to %s", self.training_metrics_path)
 
         trainer = L.Trainer(
             max_steps=self.cfg.model.training.max_steps,
-            logger=False,
+            logger=csv_logger,
             accelerator="auto",
             devices="auto",
             num_nodes=1,
             limit_train_batches=float(self.cfg.model.training.limit_train_batches),
             precision="bf16-mixed",
             accumulate_grad_batches=self.cfg.model.training.accumulate_grad_batches,
+            log_every_n_steps=self.cfg.model.training.log_every_n_steps,
         )
 
         # Use existing model or create new one
@@ -843,3 +865,85 @@ class scConcept:
         trainer.fit(model=self.model, datamodule=datamodule)
 
         logger.info("Training completed!")
+
+    def plot_training_curves(
+        self,
+        metrics_path: str | Path = None,
+        save_path: str | Path = None,
+        show: bool = True,
+        n_avg: int = 1,
+    ):
+        """Plot train/loss and train/recall@1 from the current CSVLogger metrics file.
+
+        Args:
+            metrics_path: Optional path to a CSVLogger ``metrics.csv`` file, or to the log directory
+                containing it. If omitted, uses the metrics file from the most recent ``train`` call.
+            save_path: Optional path where the generated figure should be saved.
+            show: Whether to display the figure with ``matplotlib.pyplot.show``. Set to ``False`` for
+                scripts or tests that only need the returned figure.
+            n_avg: Number of consecutive logged entries to average before plotting. Defaults to 1,
+                which plots each logged value without smoothing.
+
+        Returns:
+            A tuple of ``(fig, axes)`` from matplotlib.
+        """
+        if metrics_path is None:
+            metrics_path = self.training_metrics_path
+        if metrics_path is None:
+            raise ValueError("No training metrics path is available. Call train() first or pass metrics_path.")
+        if not isinstance(n_avg, int) or isinstance(n_avg, bool) or n_avg < 1:
+            raise ValueError("n_avg must be a positive integer")
+
+        metrics_path = Path(metrics_path)
+        if metrics_path.is_dir():
+            metrics_path = metrics_path / "metrics.csv"
+        if not metrics_path.exists():
+            raise FileNotFoundError(f"Training metrics CSV not found: {metrics_path}")
+
+        import pandas as pd
+        import matplotlib.pyplot as plt
+
+        metrics = ["train/loss", "train/recall@1"]
+        metrics_df = pd.read_csv(metrics_path)
+        missing_metrics = [metric for metric in metrics if metric not in metrics_df.columns]
+        if missing_metrics:
+            available = ", ".join(metrics_df.columns)
+            raise ValueError(
+                f"Training metrics CSV is missing columns {missing_metrics}. Available columns: {available}"
+            )
+
+        x_col = "step" if "step" in metrics_df.columns else None
+        fig, axes = plt.subplots(len(metrics), 1, figsize=(8, 6), sharex=x_col is not None)
+        if len(metrics) == 1:
+            axes = [axes]
+
+        for ax, metric in zip(axes, metrics):
+            plot_df = metrics_df.dropna(subset=[metric])
+            if plot_df.empty:
+                raise ValueError(f"Training metrics CSV contains no logged values for {metric}")
+
+            x_label = x_col if x_col is not None else "row"
+            plot_df = plot_df.copy()
+            plot_df["_plot_x"] = plot_df[x_col] if x_col is not None else plot_df.index
+            if n_avg > 1:
+                plot_df["_avg_group"] = np.arange(len(plot_df)) // n_avg
+                plot_df = plot_df.groupby("_avg_group", as_index=False)[["_plot_x", metric]].mean()
+
+            x_values = plot_df["_plot_x"]
+            ax.plot(x_values, plot_df[metric], marker="o", linewidth=1.5, markersize=3)
+            ax.set_ylabel(metric)
+            ax.grid(True, alpha=0.3)
+
+        axes[-1].set_xlabel(x_label)
+        fig.suptitle("Training Curves")
+        fig.tight_layout()
+
+        if save_path is not None:
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight")
+
+        if show:
+            plt.show()
+
+        return fig, axes

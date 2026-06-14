@@ -66,7 +66,7 @@ class AnnDataModule(L.LightningDataModule):
             if isinstance(train_split[0], AnnData) or self.model_speed_sanity_check:
                 if self.model_speed_sanity_check:
                     train_split = random.choices(train_split, k=5)
-                assert within_group_sampling == ["dataset"], "within_group_sampling must be 'dataset' for AnnData objects"
+
                 # Use InMemoryCollection for AnnData objects
                 collection = InMemoryCollection(
                     adata_list=train_split,
@@ -126,9 +126,6 @@ class AnnDataModule(L.LightningDataModule):
                 val_collate_fn = self._get_collate_fn(val_kwargs, stage="val", split_input=True)
 
                 if isinstance(val_split[0], AnnData):
-                    assert within_group_sampling == ["dataset"], (
-                        "within_group_sampling must be dataset for AnnData objects"
-                    )
                     # Use InMemoryCollection for AnnData objects
                     collection = InMemoryCollection(
                         adata_list=val_split,
@@ -170,7 +167,7 @@ class AnnDataModule(L.LightningDataModule):
 
             if isinstance(test_split[0], AnnData):
                 # Use InMemoryCollection for AnnData objects
-                assert within_group_sampling == ["dataset"], "within_group_sampling must be 'dataset' for AnnData objects"
+
                 collection = InMemoryCollection(
                     adata_list=test_split,
                     obs_keys=None,

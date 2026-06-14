@@ -661,7 +661,7 @@ class ContrastiveModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         self.stage = "train"
-        self.LOGGING_STEP = batch_idx % self.log_every_n_steps == 0
+        self.LOGGING_STEP = self.global_step % self.log_every_n_steps == 0
         self.set_active_species(batch["species"][0])
 
         if self.data_loading_speed_sanity_check:
@@ -691,7 +691,7 @@ class ContrastiveModel(L.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         self.stage = "val"
-        self.LOGGING_STEP = batch_idx % self.log_every_n_steps == 0
+        self.LOGGING_STEP = self.global_step % self.log_every_n_steps == 0
         self.set_active_species(batch["species"][0])
 
         if self.data_loading_speed_sanity_check:
