@@ -20,6 +20,7 @@ from torchmetrics.functional.regression import r2_score
 
 from .modules.bert_padding import pad_input, unpad_input
 from .modules.flash_attention_layer import FlashTransformerEncoderLayer
+from .modules.mamba_encoder import MambaEncoder, MAMBA_AVAILABLE
 from .modules.transformer import TransformerEncoder
 from torch.distributed.nn.functional import all_gather
 
@@ -205,7 +206,14 @@ class ContrastiveModel(L.LightningModule):
 
         super().__init__()
         self.debug = debug
+        self.encoder_type = config.get("encoder_type", "transformer")
         self.flash_attention = config["flash_attention"]
+        if self.encoder_type != "transformer" and self.flash_attention:
+            logger.info(
+                "encoder_type=%s uses the padded (non-flash) code path; disabling flash_attention.",
+                self.encoder_type,
+            )
+            self.flash_attention = False
         if self.flash_attention and not FLASH_ATTN_AVAILABLE:
             logger.warning(
                 "flash_attention=True requires the optional 'flash_attn' package to be installed. Falling back to non flash implementation."
@@ -273,18 +281,32 @@ class ContrastiveModel(L.LightningModule):
         elif self.input_encoding == "rank_encoding":
             self.positional_encoder = PositionalEncoding(self.dim_model, max_len=self.pe_max_len)
 
-        encoder_layers = FlashTransformerEncoderLayer(
-            self.dim_model,
-            self.num_head,
-            self.dim_hid,
-            self.dropout,
-            batch_first=True,
-            use_flash_attn=self.flash_attention,
-            norm_scheme=self.norm_scheme,
-            activation=self.activation,
-        )
-        self.transformer_encoder = TransformerEncoder(encoder_layers, self.nlayers)
-        # self.transformer_encoder = torch.compile(self.transformer_encoder) #todo: check compilation
+        if self.encoder_type == "transformer":
+            encoder_layers = FlashTransformerEncoderLayer(
+                self.dim_model,
+                self.num_head,
+                self.dim_hid,
+                self.dropout,
+                batch_first=True,
+                use_flash_attn=self.flash_attention,
+                norm_scheme=self.norm_scheme,
+                activation=self.activation,
+            )
+            self.transformer_encoder = TransformerEncoder(encoder_layers, self.nlayers)
+            # self.transformer_encoder = torch.compile(self.transformer_encoder) #todo: check compilation
+        else:
+            # Mamba state-space backbone (Mamba 1/2/3). Kept under the same attribute name so the
+            # rest of the model (grad-norm logging in on_before_optimizer_step, _encode) is unchanged.
+            self.transformer_encoder = MambaEncoder(
+                d_model=self.dim_model,
+                dim_feedforward=self.dim_hid,
+                nlayers=self.nlayers,
+                encoder_type=self.encoder_type,
+                mamba_kwargs=config.get("mamba", {}),
+                dropout=self.dropout,
+                activation=self.activation,
+                norm_scheme=self.norm_scheme,
+            )
 
         if self.decoder_head:
             self.expression_decoder = GeneExpressionDecoder(self.dim_model)

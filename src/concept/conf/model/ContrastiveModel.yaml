@@ -1,5 +1,15 @@
 name: ContrastiveModel
+# Sequence backbone: "transformer" (default, flash-attention/SDPA) or a Mamba SSM:
+# "mamba"/"mamba1", "mamba2", "mamba3" (require the optional mamba_ssm + causal_conv1d packages).
+encoder_type: transformer
 flash_attention: True
+# Mamba encoder settings (ignored when encoder_type=transformer). Each layer is bidirectional
+# (forward + reverse scan) so the CLS token at position 0 can aggregate the whole cell.
+mamba:
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  bidirectional: true
 dim_gene_embs: 512
 # This depends on the type and version of pretrained vocabularies use. "facebook/esm2_t30_150M_UR50D" embeddings are of size 640.
 dim_pretrained_vocab: 640
